@@ -1,0 +1,1067 @@
+-- ==========================================
+-- SnyX Core Script (Part 1/2)
+-- ==========================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ==========================================
+-- CLEANUP EXISTING UI
+-- ==========================================
+
+local existingUI = PlayerGui:FindFirstChild("SnyX_UI")
+if existingUI then
+    existingUI:Destroy()
+end
+
+-- ==========================================
+-- CLEANUP MANAGER
+-- ==========================================
+
+local CleanupManager = {
+    Connections = {},
+    Instances = {},
+    CustomCleanups = {},
+    IsRunning = true
+}
+
+function CleanupManager:AddConn(name, connection)
+    if not connection then
+        return
+    end
+
+    if self.Connections[name] then
+        pcall(function()
+            self.Connections[name]:Disconnect()
+        end)
+    end
+
+    self.Connections[name] = connection
+end
+
+function CleanupManager:AddInstance(name, instance)
+    if not instance then
+        return
+    end
+
+    if self.Instances[name] then
+        pcall(function()
+            self.Instances[name]:Destroy()
+        end)
+    end
+
+    self.Instances[name] = instance
+end
+
+function CleanupManager:AddCustomCleanup(cleanupFunction)
+    if type(cleanupFunction) == "function" then
+        table.insert(self.CustomCleanups, cleanupFunction)
+    end
+end
+
+function CleanupManager:CleanAll()
+    if not self.IsRunning then
+        return
+    end
+
+    self.IsRunning = false
+
+    for _, connection in pairs(self.Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    for _, instance in pairs(self.Instances) do
+        pcall(function()
+            instance:Destroy()
+        end)
+    end
+
+    for _, cleanupFunction in ipairs(self.CustomCleanups) do
+        pcall(cleanupFunction)
+    end
+
+    table.clear(self.Connections)
+    table.clear(self.Instances)
+    table.clear(self.CustomCleanups)
+end
+
+CleanupManager:AddConn(
+    "ScriptDestroying",
+    script.Destroying:Connect(function()
+        CleanupManager:CleanAll()
+    end)
+)
+
+-- ==========================================
+-- GLOBAL STATE
+-- ==========================================
+
+local State = {
+    Aimbot = true,
+    TeamCheck = true,
+    WallCheck = false,
+    Prediction = true,
+    GravityCompensation = true,
+
+    TargetPartMode = "Head",
+    PingCompensation = false,
+    DropIsMultiplier = false,
+
+    AutoBulletSpeed = true,
+    BulletSpeed = 5000,
+    BulletGravity = 0,
+
+    Smoothness = 0.3,
+    FOV = 150,
+
+    ShowFOV = false,
+
+    ESP = true,
+    ESPName = false
+}
+
+local function getCamera()
+    return Workspace.CurrentCamera
+end
+
+local function getPing()
+    if not LocalPlayer then
+        return 0.025
+    end
+
+    local success, ping = pcall(function()
+        return LocalPlayer:GetNetworkPing()
+    end)
+
+    if success and type(ping) == "number" then
+        return math.clamp(ping / 2, 0, 0.5)
+    end
+
+    return 0.025
+end
+
+-- ==========================================
+-- MAIN UI
+-- ==========================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SnyX_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = PlayerGui
+
+CleanupManager:AddInstance("MainUI", ScreenGui)
+
+-- ==========================================
+-- FOV CIRCLE
+-- ==========================================
+
+local FOVCircle = Instance.new("Frame")
+FOVCircle.Name = "FOVCircle"
+FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVCircle.BackgroundTransparency = 1
+FOVCircle.Visible = false
+FOVCircle.Parent = ScreenGui
+
+local circleCorner = Instance.new("UICorner")
+circleCorner.CornerRadius = UDim.new(1, 0)
+circleCorner.Parent = FOVCircle
+
+local circleStroke = Instance.new("UIStroke")
+circleStroke.Color = Color3.fromRGB(255, 255, 255)
+circleStroke.Thickness = 1.5
+circleStroke.Transparency = 0.3
+circleStroke.Parent = FOVCircle
+
+-- ==========================================
+-- WEAPON SERVICE
+-- ==========================================
+
+local WeaponService = {
+    Speed = 3000,
+    Gravity = Workspace.Gravity
+}
+
+local function getNumberFromConfig(config, keys)
+    if type(config) ~= "table" then
+        return nil
+    end
+
+    for _, key in ipairs(keys) do
+        local value = config[key]
+
+        if type(value) == "number" and value > 0 then
+            return value
+        end
+    end
+
+    return nil
+end
+
+function WeaponService:UpdateManual()
+    if State.AutoBulletSpeed then
+        return
+    end
+
+    self.Speed = math.max(
+        tonumber(State.BulletSpeed) or 1,
+        1
+    )
+
+    local gravity = tonumber(State.BulletGravity)
+
+    if gravity and gravity >= 0 then
+        self.Gravity = gravity
+    else
+        self.Gravity = Workspace.Gravity
+    end
+end
+
+function WeaponService:UpdateAuto()
+    if not State.AutoBulletSpeed then
+        self:UpdateManual()
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local tool = character and character:FindFirstChildOfClass("Tool")
+
+    if not tool then
+        self.Speed = math.max(
+            tonumber(State.BulletSpeed) or 3000,
+            1
+        )
+
+        self.Gravity = Workspace.Gravity
+        return
+    end
+
+    local toolName = string.lower(tool.Name)
+
+    local isLauncher =
+        string.find(toolName, "rpg", 1, true)
+        or string.find(toolName, "rocket", 1, true)
+        or string.find(toolName, "launcher", 1, true)
+        or string.find(toolName, "grenade", 1, true)
+
+    local settings =
+        tool:FindFirstChild("ACS_Settings")
+        or tool:FindFirstChild("Settings")
+        or tool:FindFirstChild("Config")
+
+    if settings and settings:IsA("ModuleScript") then
+        local success, config = pcall(require, settings)
+
+        if success and type(config) == "table" then
+            local speed = getNumberFromConfig(config, {
+                "Velo",
+                "MuzzleVelocity",
+                "BulletSpeed",
+                "Velocity",
+                "ProjectileSpeed"
+            })
+
+            self.Speed = speed or math.max(
+                tonumber(State.BulletSpeed) or 3000,
+                1
+            )
+
+            local drop =
+                config.Drop
+                or config.BulletDrop
+                or config.Gravity
+
+            if type(drop) == "number" and drop >= 0 then
+                if State.DropIsMultiplier then
+                    self.Gravity = Workspace.Gravity * drop
+                else
+                    self.Gravity = drop
+                end
+            else
+                self.Gravity = Workspace.Gravity
+            end
+
+            return
+        end
+    end
+
+    self.Speed = math.max(
+        tonumber(State.BulletSpeed) or 3000,
+        1
+    )
+
+    self.Gravity = Workspace.Gravity
+
+    if isLauncher and not string.find(toolName, "grenade", 1, true) then
+        self.Gravity = 0
+    end
+end
+
+local function setupCharacterWeaponListener(character)
+    if not character then
+        return
+    end
+
+    CleanupManager:AddConn(
+        "ToolAdded",
+        character.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then
+                task.defer(function()
+                    if CleanupManager.IsRunning then
+                        WeaponService:UpdateAuto()
+                    end
+                end)
+            end
+        end)
+    )
+
+    CleanupManager:AddConn(
+        "ToolRemoved",
+        character.ChildRemoved:Connect(function(child)
+            if child:IsA("Tool") then
+                task.defer(function()
+                    if CleanupManager.IsRunning then
+                        WeaponService:UpdateAuto()
+                    end
+                end)
+            end
+        end)
+    )
+
+    WeaponService:UpdateAuto()
+end
+
+if LocalPlayer.Character then
+    setupCharacterWeaponListener(LocalPlayer.Character)
+end
+
+CleanupManager:AddConn(
+    "CharacterAdded",
+    LocalPlayer.CharacterAdded:Connect(function(character)
+        setupCharacterWeaponListener(character)
+    end)
+)
+
+-- ==========================================
+-- VISIBILITY SERVICE
+-- ==========================================
+
+local VisibilityService = {}
+
+local sharedRaycast = RaycastParams.new()
+sharedRaycast.FilterType = Enum.RaycastFilterType.Exclude
+sharedRaycast.IgnoreWater = true
+
+function VisibilityService:GetBaseFilter()
+    local filter = {}
+
+    if LocalPlayer.Character then
+        table.insert(filter, LocalPlayer.Character)
+    end
+
+    return filter
+end
+
+function VisibilityService:CheckVisibility(
+    targetCharacter,
+    pierceCount,
+    targetPart
+)
+    if not targetCharacter
+        or not targetCharacter.Parent then
+        return false
+    end
+
+    local camera = getCamera()
+    if not camera then
+        return false
+    end
+
+    targetPart =
+        targetPart
+        or targetCharacter:FindFirstChild("Head")
+        or targetCharacter:FindFirstChild("HumanoidRootPart")
+
+    if not targetPart
+        or not targetPart:IsA("BasePart")
+        or not targetPart.Parent then
+        return false
+    end
+
+    local targetPosition = targetPart.Position
+    local currentOrigin = camera.CFrame.Position
+    local dynamicFilter = self:GetBaseFilter()
+
+    local maxPierces = math.max(
+        math.floor(tonumber(pierceCount) or 1),
+        1
+    )
+
+    for _ = 1, maxPierces do
+        local direction = targetPosition - currentOrigin
+
+        if direction.Magnitude <= 0.01 then
+            return true
+        end
+
+        sharedRaycast.FilterDescendantsInstances = dynamicFilter
+
+        local result = Workspace:Raycast(
+            currentOrigin,
+            direction,
+            sharedRaycast
+        )
+
+        if not result then
+            return true
+        end
+
+        local hitPart = result.Instance
+
+        if hitPart:IsDescendantOf(targetCharacter) then
+            return true
+        end
+
+        local canIgnore =
+            hitPart.Transparency >= 0.8
+            or not hitPart.CanCollide
+
+        if maxPierces > 1 and canIgnore then
+            table.insert(dynamicFilter, hitPart)
+
+            local remainingDirection =
+                targetPosition - result.Position
+
+            if remainingDirection.Magnitude <= 0.01 then
+                return true
+            end
+
+            currentOrigin =
+                result.Position
+                + remainingDirection.Unit * 0.05
+        else
+            return false
+        end
+    end
+
+    return false
+end
+
+-- ==========================================
+-- VALID TARGET CHECK
+-- ==========================================
+
+local function isValidEnemy(player)
+    if not player
+        or player == LocalPlayer
+        or not player.Character then
+        return false
+    end
+
+    local character = player.Character
+
+    local humanoid =
+        character:FindFirstChildOfClass("Humanoid")
+
+    local rootPart =
+        character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid
+        or humanoid.Health <= 0
+        or not rootPart then
+        return false
+    end
+
+    if character:FindFirstChildOfClass("ForceField") then
+        return false
+    end
+
+    if State.TeamCheck
+        and player.Team
+        and LocalPlayer.Team
+        and player.Team == LocalPlayer.Team then
+        return false
+    end
+
+    return true
+end
+-- ==========================================
+-- TARGET SERVICE
+-- ==========================================
+
+local TargetService = {
+    CurrentTarget = nil,
+    TargetPart = nil
+}
+
+function TargetService:GetTargetPart(character)
+    if not character then
+        return nil
+    end
+
+    local rootPart =
+        character:FindFirstChild("HumanoidRootPart")
+
+    if State.TargetPartMode == "Head" then
+        return character:FindFirstChild("Head")
+            or rootPart
+    end
+
+    if State.TargetPartMode == "Torso" then
+        return character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso")
+            or rootPart
+    end
+
+    if State.TargetPartMode == "Random" then
+        local possibleParts = {
+            "Head",
+            "UpperTorso",
+            "Torso",
+            "LowerTorso",
+            "HumanoidRootPart"
+        }
+
+        local availableParts = {}
+
+        for _, partName in ipairs(possibleParts) do
+            local part = character:FindFirstChild(partName)
+
+            if part and part:IsA("BasePart") then
+                table.insert(availableParts, part)
+            end
+        end
+
+        if #availableParts > 0 then
+            return availableParts[
+                math.random(1, #availableParts)
+            ]
+        end
+    end
+
+    return rootPart
+end
+
+function TargetService:ReleaseTarget()
+    self.CurrentTarget = nil
+    self.TargetPart = nil
+end
+
+function TargetService:KeepTarget(camera, screenCenter)
+    local target = self.CurrentTarget
+    local targetPart = self.TargetPart
+
+    if not isValidEnemy(target) then
+        return false
+    end
+
+    if not targetPart
+        or not targetPart:IsA("BasePart")
+        or not targetPart.Parent
+        or not targetPart:IsDescendantOf(target.Character) then
+        return false
+    end
+
+    if State.WallCheck then
+        local visible = VisibilityService:CheckVisibility(
+            target.Character,
+            1,
+            targetPart
+        )
+
+        if not visible then
+            return false
+        end
+    end
+
+    local screenPoint, onScreen =
+        camera:WorldToViewportPoint(targetPart.Position)
+
+    if not onScreen or screenPoint.Z <= 0 then
+        return false
+    end
+
+    local screenPosition =
+        Vector2.new(screenPoint.X, screenPoint.Y)
+
+    local distanceFromCenter =
+        (screenPosition - screenCenter).Magnitude
+
+    if distanceFromCenter > State.FOV * 1.2 then
+        return false
+    end
+
+    return true
+end
+
+function TargetService:AcquireTarget(camera, screenCenter)
+    local closestPlayer = nil
+    local closestPart = nil
+    local shortestDistance = math.max(
+        tonumber(State.FOV) or 150,
+        1
+    )
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidEnemy(player) then
+            local character = player.Character
+            local targetPart = self:GetTargetPart(character)
+
+            if targetPart then
+                local visible = true
+
+                if State.WallCheck then
+                    visible = VisibilityService:CheckVisibility(
+                        character,
+                        1,
+                        targetPart
+                    )
+                end
+
+                if visible then
+                    local screenPoint, onScreen =
+                        camera:WorldToViewportPoint(
+                            targetPart.Position
+                        )
+
+                    if onScreen and screenPoint.Z > 0 then
+                        local screenPosition =
+                            Vector2.new(
+                                screenPoint.X,
+                                screenPoint.Y
+                            )
+
+                        local distanceFromCenter =
+                            (screenPosition - screenCenter).Magnitude
+
+                        if distanceFromCenter < shortestDistance then
+                            shortestDistance = distanceFromCenter
+                            closestPlayer = player
+                            closestPart = targetPart
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if closestPlayer and closestPart then
+        self.CurrentTarget = closestPlayer
+        self.TargetPart = closestPart
+    end
+end
+
+-- ==========================================
+-- PROJECTILE PREDICTION
+-- ==========================================
+
+local function getPredictedPosition(targetPart, rootPart)
+    if not targetPart or not rootPart then
+        return nil
+    end
+
+    local camera = getCamera()
+
+    if not camera then
+        return targetPart.Position
+    end
+
+    local targetPosition = targetPart.Position
+
+    if not State.Prediction then
+        return targetPosition
+    end
+
+    local bulletSpeed = math.max(
+        tonumber(WeaponService.Speed) or 1,
+        1
+    )
+
+    local distance =
+        (targetPosition - camera.CFrame.Position).Magnitude
+
+    local flightTime = math.clamp(
+        distance / bulletSpeed,
+        0,
+        5
+    )
+
+    local velocity = rootPart.AssemblyLinearVelocity
+
+    if velocity.Magnitude > 0.5 then
+        targetPosition += velocity * flightTime
+
+        if State.PingCompensation then
+            local pingTime = math.clamp(getPing(), 0, 0.5)
+            targetPosition += velocity * pingTime
+        end
+    end
+
+    local gravity = math.max(
+        tonumber(WeaponService.Gravity) or 0,
+        0
+    )
+
+    if State.GravityCompensation and gravity > 0 then
+        local verticalCorrection =
+            0.5 * gravity * flightTime * flightTime
+
+        targetPosition += Vector3.new(
+            0,
+            verticalCorrection,
+            0
+        )
+    end
+
+    return targetPosition
+end
+
+-- ==========================================
+-- ESP SERVICE
+-- ==========================================
+
+local ESPService = {
+    Cache = {},
+
+    COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
+    COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50),
+    COLOR_VISIBLE_OUTLINE = Color3.fromRGB(255, 215, 0),
+    COLOR_OBSTRUCTED_OUTLINE = Color3.fromRGB(100, 0, 0)
+}
+
+function ESPService:RemoveVisuals(data)
+    if not data then
+        return
+    end
+
+    if data.Highlight then
+        pcall(function()
+            data.Highlight:Destroy()
+        end)
+
+        data.Highlight = nil
+    end
+
+    if data.NameTag then
+        pcall(function()
+            data.NameTag:Destroy()
+        end)
+
+        data.NameTag = nil
+    end
+end
+
+function ESPService:AddPlayer(player)
+    if not player or player == LocalPlayer then
+        return
+    end
+
+    if self.Cache[player] then
+        self:RemovePlayer(player)
+    end
+
+    local data = {
+        Character = nil,
+        Highlight = nil,
+        NameTag = nil,
+        Visible = false,
+        LastCheck = 0,
+        CharacterConnection = nil
+    }
+
+    self.Cache[player] = data
+
+    local function onCharacterAdded(character)
+        if self.Cache[player] then
+            self:SetupCharacterESP(player, character)
+        end
+    end
+
+    if player.Character then
+        onCharacterAdded(player.Character)
+    end
+
+    data.CharacterConnection =
+        player.CharacterAdded:Connect(onCharacterAdded)
+end
+
+function ESPService:SetupCharacterESP(player, character)
+    local data = self.Cache[player]
+
+    if not data
+        or not character
+        or not character.Parent then
+        return
+    end
+
+    self:RemoveVisuals(data)
+
+    data.Character = character
+    data.Visible = false
+    data.LastCheck = 0
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "ESP_Highlight"
+    highlight.FillTransparency = 0.25
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillColor = self.COLOR_OBSTRUCTED
+    highlight.OutlineColor = self.COLOR_OBSTRUCTED_OUTLINE
+    highlight.Enabled = State.ESP and isValidEnemy(player)
+    highlight.Parent = character
+
+    data.Highlight = highlight
+
+    task.spawn(function()
+        local head = character:WaitForChild("Head", 5)
+
+        if not head
+            or not head.Parent
+            or not data.Character
+            or data.Character ~= character
+            or not self.Cache[player] then
+            return
+        end
+
+        local nameTag = Instance.new("BillboardGui")
+        nameTag.Name = "ESP_NameTag"
+        nameTag.Adornee = head
+        nameTag.Size = UDim2.fromOffset(150, 30)
+        nameTag.StudsOffset = Vector3.new(0, 2, 0)
+        nameTag.AlwaysOnTop = true
+        nameTag.Enabled =
+            State.ESPName and isValidEnemy(player)
+
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Name = "TagLabel"
+        textLabel.Size = UDim2.fromScale(1, 1)
+        textLabel.BackgroundTransparency = 1
+        textLabel.Text = player.Name
+        textLabel.TextColor3 = self.COLOR_OBSTRUCTED
+        textLabel.TextStrokeTransparency = 0
+        textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        textLabel.Font = Enum.Font.SourceSansBold
+        textLabel.TextSize = 14
+        textLabel.Parent = nameTag
+
+        nameTag.Parent = character
+        data.NameTag = nameTag
+    end)
+end
+
+function ESPService:UpdateState()
+    for player, data in pairs(self.Cache) do
+        local valid = isValidEnemy(player)
+
+        if data.Highlight then
+            data.Highlight.Enabled = State.ESP and valid
+        end
+
+        if data.NameTag then
+            data.NameTag.Enabled = State.ESPName and valid
+        end
+    end
+end
+
+function ESPService:ProcessOcclusion()
+    if not State.ESP and not State.ESPName then
+        return
+    end
+
+    local currentTime = os.clock()
+
+    for player, data in pairs(self.Cache) do
+        local character = data.Character
+
+        if character
+            and character.Parent
+            and isValidEnemy(player)
+            and currentTime - data.LastCheck >= 0.35 then
+
+            local targetPart =
+                character:FindFirstChild("Head")
+                or character:FindFirstChild("HumanoidRootPart")
+
+            if targetPart then
+                data.Visible =
+                    VisibilityService:CheckVisibility(
+                        character,
+                        5,
+                        targetPart
+                    )
+
+                data.LastCheck = currentTime
+
+                local fillColor = data.Visible
+                    and self.COLOR_VISIBLE
+                    or self.COLOR_OBSTRUCTED
+
+                local outlineColor = data.Visible
+                    and self.COLOR_VISIBLE_OUTLINE
+                    or self.COLOR_OBSTRUCTED_OUTLINE
+
+                if data.Highlight then
+                    data.Highlight.FillColor = fillColor
+                    data.Highlight.OutlineColor = outlineColor
+                end
+
+                if data.NameTag then
+                    local label =
+                        data.NameTag:FindFirstChild("TagLabel")
+
+                    if label then
+                        label.TextColor3 = fillColor
+                    end
+                end
+            end
+        end
+    end
+end
+
+function ESPService:RemovePlayer(player)
+    local data = self.Cache[player]
+
+    if not data then
+        return
+    end
+
+    if data.CharacterConnection then
+        pcall(function()
+            data.CharacterConnection:Disconnect()
+        end)
+
+        data.CharacterConnection = nil
+    end
+
+    self:RemoveVisuals(data)
+    self.Cache[player] = nil
+end
+
+function ESPService:ClearAll()
+    for player in pairs(self.Cache) do
+        self:RemovePlayer(player)
+    end
+end
+
+CleanupManager:AddCustomCleanup(function()
+    ESPService:ClearAll()
+end)
+
+CleanupManager:AddConn(
+    "ESPPlayerAdded",
+    Players.PlayerAdded:Connect(function(player)
+        ESPService:AddPlayer(player)
+    end)
+)
+
+CleanupManager:AddConn(
+    "ESPPlayerRemoving",
+    Players.PlayerRemoving:Connect(function(player)
+        ESPService:RemovePlayer(player)
+    end)
+)
+
+for _, player in ipairs(Players:GetPlayers()) do
+    ESPService:AddPlayer(player)
+end
+
+task.spawn(function()
+    while CleanupManager.IsRunning do
+        task.wait(0.15)
+
+        if CleanupManager.IsRunning then
+            ESPService:ProcessOcclusion()
+        end
+    end
+end)
+
+-- ==========================================
+-- MAIN LOOP (AIMBOT & FOV UPDATE)
+-- ==========================================
+
+local isAiming = false
+
+CleanupManager:AddConn(
+    "AimKey_Down",
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if not gameProcessed and input.UserInputType == Enum.UserInputType.MouseButton2 then
+            isAiming = true
+        end
+    end)
+)
+
+CleanupManager:AddConn(
+    "AimKey_Up",
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            isAiming = false
+            TargetService:ReleaseTarget()
+        end
+    end)
+)
+
+CleanupManager:AddConn(
+    "MainRenderLoop",
+    RunService.RenderStepped:Connect(function()
+        if not CleanupManager.IsRunning then return end
+
+        local camera = getCamera()
+        if not camera then return end
+
+        local viewportSize = camera.ViewportSize
+        local screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
+
+        if State.ShowFOV and FOVCircle then
+            FOVCircle.Visible = true
+            FOVCircle.Position = UDim2.fromOffset(screenCenter.X, screenCenter.Y)
+            FOVCircle.Size = UDim2.fromOffset(State.FOV * 2, State.FOV * 2)
+        else
+            if FOVCircle then
+                FOVCircle.Visible = false
+            end
+        end
+
+        if not State.Aimbot or not isAiming then
+            TargetService:ReleaseTarget()
+            return
+        end
+
+        if TargetService.CurrentTarget then
+            local isValid = TargetService:KeepTarget(camera, screenCenter)
+            if not isValid then
+                TargetService:ReleaseTarget()
+            end
+        end
+
+        if not TargetService.CurrentTarget then
+            TargetService:AcquireTarget(camera, screenCenter)
+        end
+
+        local target = TargetService.CurrentTarget
+        local targetPart = TargetService.TargetPart
+
+        if target and targetPart then
+            local character = target.Character
+            local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+            if rootPart then
+                local predictedPos = getPredictedPosition(targetPart, rootPart)
+                
+                if predictedPos then
+                    local currentCFrame = camera.CFrame
+                    local targetCFrame = CFrame.new(currentCFrame.Position, predictedPos)
+                    
+                    camera.CFrame = currentCFrame:Lerp(targetCFrame, State.Smoothness)
+                end
+            end
+        end
+    end)
+)
