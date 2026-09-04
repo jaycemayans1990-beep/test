@@ -404,6 +404,7 @@ MainFrame.Visible = false
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
 
+-- แถบ Title สำหรับจับลาก
 local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, 0, 0, 40)
 Title.BackgroundTransparency = 1
@@ -411,20 +412,32 @@ Title.Text = "SnyX Control Panel"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 16
+Title.Active = true
 Title.Parent = MainFrame
 
+-- พื้นที่สำหรับ Scroll เลื่อนขึ้นลง
+local ScrollFrame = Instance.new("ScrollingFrame")
+ScrollFrame.Size = UDim2.new(1, 0, 1, -40)
+ScrollFrame.Position = UDim2.new(0, 0, 0, 40)
+ScrollFrame.BackgroundTransparency = 1
+ScrollFrame.BorderSizePixel = 0
+ScrollFrame.ScrollBarThickness = 4
+ScrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+ScrollFrame.Parent = MainFrame
+
 local Layout = Instance.new("UIListLayout")
-Layout.Parent = MainFrame
+Layout.Parent = ScrollFrame
 Layout.Padding = UDim.new(0, 5)
 Layout.SortOrder = Enum.SortOrder.LayoutOrder
 
 local Padding = Instance.new("UIPadding")
-Padding.Parent = MainFrame
-Padding.PaddingTop = UDim.new(0, 45)
+Padding.Parent = ScrollFrame
+Padding.PaddingTop = UDim.new(0, 5)
 Padding.PaddingLeft = UDim.new(0, 10)
 Padding.PaddingRight = UDim.new(0, 10)
 
--- ลาก UI ได้
+-- ระบบลาก UI (ลากที่แถบ Title)
 local dragging, dragInput, dragStart, startPos
 Title.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -452,7 +465,7 @@ local function CreateToggle(text, stateKey, callback)
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(1, 0, 0, 35)
     frame.BackgroundTransparency = 1
-    frame.Parent = MainFrame
+    frame.Parent = ScrollFrame -- ย้ายมาใส่ใน ScrollFrame
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, -50, 1, 0)
@@ -484,7 +497,7 @@ local function CreateSlider(text, stateKey, min, max)
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(1, 0, 0, 45)
     frame.BackgroundTransparency = 1
-    frame.Parent = MainFrame
+    frame.Parent = ScrollFrame -- ย้ายมาใส่ใน ScrollFrame
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, 0, 0, 20)
@@ -544,92 +557,3 @@ CreateToggle("ESP Names", "ESPName", function() ESPService:UpdateState() end)
 CreateSlider("FOV Size", "FOV", 50, 500)
 CreateSlider("Smoothness", "Smoothness", 0, 1)
 
--- ==========================================
--- FOV CIRCLE
--- ==========================================
-
-local FOVCircle = Instance.new("Frame")
-FOVCircle.Name = "FOVCircle"
-FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
-FOVCircle.BackgroundTransparency = 1
-FOVCircle.Visible = false
-FOVCircle.Parent = ScreenGui
-
-local circleCorner = Instance.new("UICorner")
-circleCorner.CornerRadius = UDim.new(1, 0)
-circleCorner.Parent = FOVCircle
-
-local circleStroke = Instance.new("UIStroke")
-circleStroke.Color = Color3.fromRGB(255, 255, 255)
-circleStroke.Thickness = 1.5
-circleStroke.Transparency = 0.3
-circleStroke.Parent = FOVCircle
-
--- ==========================================
--- MAIN LOOP (AIMBOT & RENDER)
--- ==========================================
-
-local isAiming = false
-
-CleanupManager:AddConn("AimKey_Down", UserInputService.InputBegan:Connect(function(input, gp)
-    if not gp and input.UserInputType == Enum.UserInputType.MouseButton2 then
-        isAiming = true
-    end
-end))
-
-CleanupManager:AddConn("AimKey_Up", UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        isAiming = false
-        TargetService:ReleaseTarget()
-    end
-end))
-
-CleanupManager:AddConn("MainRenderLoop", RunService.RenderStepped:Connect(function()
-    if not CleanupManager.IsRunning then return end
-    local camera = Workspace.CurrentCamera
-    if not camera then return end
-
-    local viewportSize = camera.ViewportSize
-    local screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
-
-    -- อัปเดต FOV Circle
-    if State.ShowFOV then
-        FOVCircle.Visible = true
-        FOVCircle.Position = UDim2.fromOffset(screenCenter.X, screenCenter.Y)
-        FOVCircle.Size = UDim2.fromOffset(State.FOV * 2, State.FOV * 2)
-    else
-        FOVCircle.Visible = false
-    end
-
-    -- ประมวลผล Aimbot
-    if not State.Aimbot or not isAiming then
-        TargetService:ReleaseTarget()
-        return
-    end
-
-    if TargetService.CurrentTarget then
-        if not TargetService:KeepTarget(camera, screenCenter) then
-            TargetService:ReleaseTarget()
-        end
-    end
-
-    if not TargetService.CurrentTarget then
-        TargetService:AcquireTarget(camera, screenCenter)
-    end
-
-    local target = TargetService.CurrentTarget
-    local targetPart = TargetService.TargetPart
-
-    if target and targetPart then
-        local rootPart = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
-        if rootPart then
-            local predictedPos = getPredictedPosition(targetPart, rootPart)
-            if predictedPos then
-                local currentCFrame = camera.CFrame
-                local targetCFrame = CFrame.new(currentCFrame.Position, predictedPos)
-                -- ใช้ค่า Smoothness ปรับความสมูทในการหันกล้อง (0 = แข็ง, 1 = ช้ามาก)
-                camera.CFrame = currentCFrame:Lerp(targetCFrame, State.Smoothness)
-            end
-        end
-    end
-end))
