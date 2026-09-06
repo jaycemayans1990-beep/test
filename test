@@ -1,6 +1,5 @@
 -- =====================================================================
--- CAMERA-BASED AIM ASSIST & APPROXIMATE PREDICTION SYSTEM
--- Target Environment: LocalScript (Client-Side Only)
+-- APPROXIMATE PREDICTION AIMBOT & ESP (PRODUCTION-READY ARCHITECTURE)
 -- =====================================================================
 
 local Players = game:GetService("Players")
@@ -8,21 +7,15 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-
--- เคลียร์ UI เก่า (จัดการได้เฉพาะ Instance และ Connection ที่เป็นลูกของ UI)
--- ลูปหลงเหลือจาก Script เก่าต้องอาศัย script.Destroying ของตัวมันเองในการเคลียร์
-local existingUI = PlayerGui:FindFirstChild("SnyX_UI")
-if existingUI then existingUI:Destroy() end
 
 -- ==========================================
--- 1. CLEANUP MANAGER (Lifecycle Control)
+-- 1. CLEANUP MANAGER (Complete Lifecycle)
 -- ==========================================
 local CleanupManager = {
     Connections = {},
     Instances = {},
-    CustomCleanups = {},
-    IsRunning = true
+    Drawings = {},
+    CustomCleanups = {} -- สำหรับ Delegate หน้าที่ Cleanup ให้ Service อื่นๆ
 }
 
 function CleanupManager:AddConn(name, conn)
@@ -35,35 +28,41 @@ function CleanupManager:AddInstance(name, inst)
     self.Instances[name] = inst
 end
 
+function CleanupManager:AddDrawing(name, drawing)
+    if self.Drawings[name] then self.Drawings[name]:Remove() end
+    self.Drawings[name] = drawing
+end
+
 function CleanupManager:AddCustomCleanup(func)
     table.insert(self.CustomCleanups, func)
 end
 
 function CleanupManager:CleanAll()
-    self.IsRunning = false 
+    getgenv().SnyX_Running = false 
     
     for _, conn in pairs(self.Connections) do conn:Disconnect() end
     for _, inst in pairs(self.Instances) do inst:Destroy() end
+    for _, draw in pairs(self.Drawings) do draw:Remove() end
     for _, func in ipairs(self.CustomCleanups) do pcall(func) end
     
     table.clear(self.Connections)
     table.clear(self.Instances)
+    table.clear(self.Drawings)
     table.clear(self.CustomCleanups)
 end
 
-script.Destroying:Connect(function()
-    CleanupManager:CleanAll()
-end)
+if getgenv().SnyX_Cleanup then getgenv().SnyX_Cleanup:CleanAll() end
+getgenv().SnyX_Cleanup = CleanupManager
+getgenv().SnyX_Running = true
 
 -- ==========================================
--- 2. GLOBAL STATE
+-- 2. STATE (Global Configuration)
 -- ==========================================
 local State = {
     Aimbot = true,
     TeamCheck = true,
     WallCheck = false,
     Prediction = true,
-    GravityCompensation = true, 
     TargetPartMode = "Head", 
     PingCompensation = false,
     DropIsMultiplier = false,
@@ -77,7 +76,30 @@ local State = {
     ESPName = false
 }
 
+-- CACHED LERP SPEED — avoid math.clamp every frame
 local function getCamera() return Workspace.CurrentCamera end
+local _cachedLerpSpeed = 0.3 * 35
+local _lastSmoothness = 0.3
+
+-- WALLCHECK THROTTLE — run raycast every N frames to avoid per-frame raycast cost
+local _wallcheckFrame = 0
+local _wallcheckThrottle = 4  -- every 4 frames (~15fps effective for wallcheck)
+local _cachedTargetVisible = {} -- [player] = bool
+
+local function invalidateWallCache(player)
+    _cachedTargetVisible[player] = nil
+end
+
+local function needsWallCheck(player)
+    _wallcheckFrame = _wallcheckFrame + 1
+    if _wallcheckFrame % _wallcheckThrottle == 0 then
+        _cachedTargetVisible[player] = nil
+    end
+    if _cachedTargetVisible[player] == nil and player and player.Character then
+        _cachedTargetVisible[player] = VisibilityService:CheckVisibility(player.Character, 1)
+    end
+    return _cachedTargetVisible[player] or false
+end
 
 local function getPing()
     if not LocalPlayer then return 0 end
@@ -86,33 +108,7 @@ local function getPing()
 end
 
 -- ==========================================
--- 3. MAIN UI & FOV CIRCLE
--- ==========================================
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "SnyX_UI"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.IgnoreGuiInset = true
-ScreenGui.Parent = PlayerGui
-CleanupManager:AddInstance("MainUI", ScreenGui)
-
-local FOVCircle = Instance.new("Frame")
-FOVCircle.Name = "FOVCircle"
-FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
-FOVCircle.BackgroundTransparency = 1
-FOVCircle.Parent = ScreenGui
-
-local circleCorner = Instance.new("UICorner")
-circleCorner.CornerRadius = UDim.new(1, 0)
-circleCorner.Parent = FOVCircle
-
-local circleStroke = Instance.new("UIStroke")
-circleStroke.Color = Color3.fromRGB(255, 255, 255)
-circleStroke.Thickness = 1.5
-circleStroke.Transparency = 0.3
-circleStroke.Parent = FOVCircle
-
--- ==========================================
--- 4. HEURISTIC WEAPON SERVICE
+-- 3. WEAPON SERVICE (Cached Weapon Stats)
 -- ==========================================
 local WeaponService = {
     Speed = 3000,
@@ -135,13 +131,12 @@ function WeaponService:UpdateAuto()
     if tool then
         local toolName = tool.Name:lower()
         local isLauncher = toolName:find("rpg") or toolName:find("rocket") or toolName:find("launcher") or toolName:find("grenade")
-        
-        -- หมายเหตุ: ระบบนี้เป็นเพียง Heuristic หากเกมใช้ระบบ Attribute หรือตัวแปรฝั่ง Server จะไม่สามารถอ่านค่าได้
         local acsSettings = tool:FindFirstChild("ACS_Settings") or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
+        
         if acsSettings and acsSettings:IsA("ModuleScript") then
             local success, config = pcall(require, acsSettings)
             if success and type(config) == "table" then
-                local speed = config.Velo or config.MuzzleVelocity or config.BulletSpeed or config.Velocity or config.ProjectileSpeed
+                local speed = config.Velo or config.MuzzleVelocity or config.BulletSpeed or config.Velocity
                 self.Speed = (type(speed) == "number" and speed > 0) and speed or (State.BulletSpeed or 10000)
 
                 local drop = config.Drop or config.BulletDrop or config.Gravity
@@ -154,7 +149,6 @@ function WeaponService:UpdateAuto()
             end
         end
     end
-    
     self.Speed = math.max(State.BulletSpeed or 3000, 1)
     self.Gravity = workspace.Gravity
 end
@@ -174,7 +168,7 @@ if LocalPlayer.Character then setupCharacterWeaponListener(LocalPlayer.Character
 CleanupManager:AddConn("CharAdded", LocalPlayer.CharacterAdded:Connect(setupCharacterWeaponListener))
 
 -- ==========================================
--- 5. VISIBILITY SERVICE (Shared Raycast Parameters)
+-- 4. VISIBILITY SERVICE (Immutable Raycast)
 -- ==========================================
 local VisibilityService = {}
 local sharedRaycast = RaycastParams.new()
@@ -234,7 +228,7 @@ local function isValidEnemy(player)
 end
 
 -- ==========================================
--- 6. TARGET ACQUISITION SERVICE
+-- 5. TARGET SERVICE (State Machine)
 -- ==========================================
 local TargetService = {
     CurrentTarget = nil,
@@ -242,21 +236,12 @@ local TargetService = {
 }
 
 function TargetService:GetTargetPart(char)
-    if not char then return nil end
     local root = char:FindFirstChild("HumanoidRootPart")
-    
-    if State.TargetPartMode == "Head" then 
-        return char:FindFirstChild("Head") or root 
-    elseif State.TargetPartMode == "Torso" then
-        return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or root
-    elseif State.TargetPartMode == "Random" then 
-        local parts = {"Head", "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart"}
-        local available = {}
-        for _, p in ipairs(parts) do
-            local found = char:FindFirstChild(p)
-            if found then table.insert(available, found) end
-        end
-        if #available > 0 then return available[math.random(1, #available)] end
+    if State.TargetPartMode == "Head" then return char:FindFirstChild("Head") or root end
+    if State.TargetPartMode == "Random" then 
+        local parts = {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}
+        local selected = parts[math.random(1, #parts)]
+        return char:FindFirstChild(selected) or root
     end
     return root 
 end
@@ -267,19 +252,31 @@ function TargetService:ReleaseTarget()
 end
 
 function TargetService:KeepTarget(camera, screenCenter)
-    if not isValidEnemy(self.CurrentTarget) then return false end
-    
-    if not self.TargetPart or not self.TargetPart.Parent or not self.TargetPart:IsDescendantOf(self.CurrentTarget.Character) then
-        return false
-    end
-    
-    if State.WallCheck and not VisibilityService:CheckVisibility(self.CurrentTarget.Character, 1) then return false end
+    -- Fast path: reuse previously cached visibility if still fresh
+    local ct = self.CurrentTarget
+    if not ct or not ct.Character then return false end
+    local char = ct.Character
+    if not char:FindFirstChildOfClass("Humanoid") or char:FindFirstChildOfClass("Humanoid").Health <= 0 then return false end
 
-    local screenPoint, onScreen = camera:WorldToViewportPoint(self.TargetPart.Position)
+    if State.TeamCheck and ct.Team and LocalPlayer.Team and ct.Team == LocalPlayer.Team then return false end
+    if ct.Character:FindFirstChildOfClass("ForceField") then return false end
+
+    -- Throttled wallcheck (runs every 4 frames via needsWallCheck)
+    if State.WallCheck and not needsWallCheck(ct) then return false end
+
+    -- Target part may have been destroyed / character may have changed
+    if not self.TargetPart or not self.TargetPart.Parent or not self.TargetPart:IsDescendantOf(char) then
+        -- Try to refresh target part
+        self.TargetPart = self:GetTargetPart(char)
+        if not self.TargetPart then return false end
+    end
+
+    local sp, onScreen = camera:WorldToViewportPoint(self.TargetPart.Position)
     if not onScreen then return false end
 
-    local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
-    if dist > (State.FOV * 1.2) then return false end
+    -- Inline distance (avoids Vector2.new allocation)
+    local dx, dy = sp.X - screenCenter.X, sp.Y - screenCenter.Y
+    if (dx*dx + dy*dy) > (State.FOV * 1.2) ^ 2 then return false end
 
     return true
 end
@@ -287,19 +284,31 @@ end
 function TargetService:AcquireTarget(camera, screenCenter)
     local closestPlayer = nil
     local shortestDist = State.FOV
+    local shortestDistSq = State.FOV * State.FOV
     local bestPart = nil
+    local fovSq = State.FOV * State.FOV
 
     for _, player in ipairs(Players:GetPlayers()) do
-        if isValidEnemy(player) then
-            local tempPart = self:GetTargetPart(player.Character)
-            if tempPart and (not State.WallCheck or VisibilityService:CheckVisibility(player.Character, 1)) then
-                local screenPoint, onScreen = camera:WorldToViewportPoint(tempPart.Position)
-                if onScreen then
-                    local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
-                    if dist < shortestDist then
-                        shortestDist = dist
-                        closestPlayer = player
-                        bestPart = tempPart
+        if player ~= LocalPlayer and player.Character then
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 then
+            elseif not player.Character:FindFirstChildOfClass("ForceField") then
+                if not (State.TeamCheck and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team) then
+                    local tempPart = self:GetTargetPart(player.Character)
+                    if tempPart then
+                        if not State.WallCheck or needsWallCheck(player) then
+                            local sp, onScreen = camera:WorldToViewportPoint(tempPart.Position)
+                            if onScreen then
+                                -- Inline distance squared (avoids allocation)
+                                local dx, dy = sp.X - screenCenter.X, sp.Y - screenCenter.Y
+                                local distSq = dx*dx + dy*dy
+                                if distSq < shortestDistSq then
+                                    shortestDistSq = distSq
+                                    closestPlayer = player
+                                    bestPart = tempPart
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -309,11 +318,12 @@ function TargetService:AcquireTarget(camera, screenCenter)
     if closestPlayer then
         self.CurrentTarget = closestPlayer
         self.TargetPart = bestPart
+        _cachedTargetVisible[closestPlayer] = true
     end
 end
 
 -- ==========================================
--- 7. APPROXIMATE PROJECTILE PREDICTION
+-- 6. APPROXIMATE PREDICTION ENGINE
 -- ==========================================
 local function getPredictedPosition(targetPart, rootPart)
     local targetPos = targetPart.Position
@@ -335,7 +345,7 @@ local function getPredictedPosition(targetPart, rootPart)
         end
     end
 
-    if WeaponService.Gravity > 0 and State.GravityCompensation then
+    if WeaponService.Gravity > 0 then
         local dropOffset = Vector3.new(0, 0.5 * WeaponService.Gravity * (flightTime ^ 2), 0)
         targetPos = targetPos + dropOffset
     end
@@ -344,7 +354,7 @@ local function getPredictedPosition(targetPart, rootPart)
 end
 
 -- ==========================================
--- 8. EVENT-DRIVEN ESP SERVICE (Optimized)
+-- 7. ESP SERVICE (Lifecycle & Cache Managed)
 -- ==========================================
 local ESPService = {
     Cache = {},
@@ -352,201 +362,173 @@ local ESPService = {
     COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50)
 }
 
-function ESPService:AddPlayer(player)
-    if player == LocalPlayer then return end
-    if self.Cache[player] then self:RemovePlayer(player) end
-
-    self.Cache[player] = {
-        Character = nil,
-        Highlight = nil,
-        NameTag = nil,
-        Visible = false,
-        LastCheck = 0,
-        CharConn = nil
-    }
-
-    local function onCharAdded(char)
-        self:SetupCharacterESP(player, char)
-    end
-
-    if player.Character then onCharAdded(player.Character) end
-    self.Cache[player].CharConn = player.CharacterAdded:Connect(onCharAdded)
-end
-
-function ESPService:SetupCharacterESP(player, char)
-    local data = self.Cache[player]
-    if not data then return end
-    
-    if data.Highlight then data.Highlight:Destroy() end
-    if data.NameTag then data.NameTag:Destroy() end
-    
-    data.Character = char
-    data.LastCheck = 0
-    data.Visible = false
-    
-    local hl = Instance.new("Highlight")
-    hl.Name = "ESP_Highlight"
-    hl.FillTransparency = 0.25
-    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.FillColor = self.COLOR_OBSTRUCTED
-    hl.OutlineColor = Color3.fromRGB(100, 0, 0)
-    hl.Enabled = State.ESP and isValidEnemy(player)
-    hl.Parent = char
-    data.Highlight = hl
-
-    task.spawn(function()
-        local head = char:WaitForChild("Head", 5)
-        if head and data.Character == char then
-            local nt = Instance.new("BillboardGui")
-            nt.Name = "ESP_NameTag"
-            nt.Adornee = head
-            nt.Size = UDim2.new(0, 150, 0, 30)
-            nt.StudsOffset = Vector3.new(0, 2, 0)
-            nt.AlwaysOnTop = true
-            
-            local textLabel = Instance.new("TextLabel")
-            textLabel.Name = "TagLabel"
-            textLabel.Size = UDim2.new(1, 0, 1, 0)
-            textLabel.BackgroundTransparency = 1
-            textLabel.TextStrokeTransparency = 0
-            textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-            textLabel.Font = Enum.Font.SourceSansBold
-            textLabel.TextSize = 14
-            textLabel.Text = player.Name
-            textLabel.TextColor3 = self.COLOR_OBSTRUCTED
-            textLabel.Parent = nt
-
-            nt.Enabled = State.ESPName and isValidEnemy(player)
-            nt.Parent = char
-            data.NameTag = nt
-        end
-    end)
-end
-
-function ESPService:UpdateState()
-    for player, data in pairs(self.Cache) do
-        local valid = isValidEnemy(player)
-        if data.Highlight then
-            data.Highlight.Enabled = State.ESP and valid
-        end
-        if data.NameTag then
-            data.NameTag.Enabled = State.ESPName and valid
-        end
-    end
-end
-
-function ESPService:RemovePlayer(player)
-    local data = self.Cache[player]
-    if data then
-        if data.CharConn then data.CharConn:Disconnect() end
-        if data.Highlight then data.Highlight:Destroy() end
-        if data.NameTag then data.NameTag:Destroy() end
-        self.Cache[player] = nil
-    end
-end
-
 function ESPService:ClearAll()
-    for player, _ in pairs(self.Cache) do
-        self:RemovePlayer(player)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            local hl = player.Character:FindFirstChild("ESP_Highlight")
+            if hl then hl:Destroy() end
+            local nt = player.Character:FindFirstChild("ESP_NameTag")
+            if nt then nt:Destroy() end
+        end
     end
+    table.clear(self.Cache)
 end
 CleanupManager:AddCustomCleanup(function() ESPService:ClearAll() end)
 
-CleanupManager:AddConn("PlayerAddedESP", Players.PlayerAdded:Connect(function(player)
-    ESPService:AddPlayer(player)
-end))
+-- ลบข้อมูลออกจาก Cache ทันทีที่ผู้เล่นออก
 CleanupManager:AddConn("PlayerRemovingESP", Players.PlayerRemoving:Connect(function(player)
-    ESPService:RemovePlayer(player)
+    ESPService.Cache[player] = nil
+    _cachedTargetVisible[player] = nil
 end))
 
-for _, player in ipairs(Players:GetPlayers()) do
-    ESPService:AddPlayer(player)
-end
-
-function ESPService:ProcessOcclusion()
-    if not State.ESP and not State.ESPName then return end
+function ESPService:ProcessESP()
+    local now = tick()
     
-    local now = os.clock()
-    for player, data in pairs(self.Cache) do
-        local char = data.Character
-        if not char or not isValidEnemy(player) then continue end
-        
-        if now - data.LastCheck > 0.35 then
-            data.Visible = VisibilityService:CheckVisibility(char, 5)
-            data.LastCheck = now
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local isEnemy = isValidEnemy(player)
+            local char = player.Character
             
-            local currentColor = data.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
-            local outlineColor = data.Visible and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(100, 0, 0)
-            
-            if data.Highlight and State.ESP then
-                data.Highlight.FillColor = currentColor
-                data.Highlight.OutlineColor = outlineColor
-            end
-            if data.NameTag and State.ESPName then
-                data.NameTag.TagLabel.TextColor3 = currentColor
+            local highlight = char:FindFirstChild("ESP_Highlight")
+            local nameTag = char:FindFirstChild("ESP_NameTag")
+
+            -- FIX: replace `continue` with Lua 5.1-compatible early-out
+            if not (not State.ESP and not State.ESPName) and isEnemy then
+                -- Invalidate Cache หากผู้เล่นเกิดใหม่ (Character เปลี่ยน) หรือเวลาผ่านไปเกิน 0.35 วิ
+                if not self.Cache[player] or self.Cache[player].Character ~= char or (now - self.Cache[player].LastCheck > 0.35) then
+                    self.Cache[player] = {
+                        Character = char,
+                        Visible = VisibilityService:CheckVisibility(char, 5),
+                        LastCheck = now
+                    }
+                end
+                
+                local visible = self.Cache[player].Visible
+                local currentColor = visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+
+                if State.ESP then
+                    if not highlight then
+                        highlight = Instance.new("Highlight")
+                        highlight.Name = "ESP_Highlight"
+                        highlight.FillTransparency = 0.25
+                        highlight.Parent = char
+                    end
+                    highlight.FillColor = currentColor
+                    highlight.OutlineColor = visible and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(100, 0, 0)
+                end
+
+                if State.ESPName then
+                    local head = char:FindFirstChild("Head")
+                    if head then
+                        if not nameTag then
+                            nameTag = Instance.new("BillboardGui")
+                            nameTag.Name = "ESP_NameTag"
+                            nameTag.Adornee = head
+                            nameTag.Size = UDim2.new(0, 150, 0, 30)
+                            nameTag.StudsOffset = Vector3.new(0, 2, 0)
+                            nameTag.AlwaysOnTop = true
+                            nameTag.Parent = char
+
+                            local textLabel = Instance.new("TextLabel")
+                            textLabel.Name = "TagLabel"
+                            textLabel.Size = UDim2.new(1, 0, 1, 0)
+                            textLabel.BackgroundTransparency = 1
+                            textLabel.Text = player.Name
+                            textLabel.TextStrokeTransparency = 0
+                            textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                            textLabel.Font = Enum.Font.SourceSansBold
+                            textLabel.TextSize = 14
+                            textLabel.Parent = nameTag
+                        end
+                        nameTag.TagLabel.TextColor3 = currentColor
+                    end
+                end
             end
         end
     end
 end
 
 task.spawn(function()
-    while CleanupManager.IsRunning do 
-        task.wait(0.15)
-        ESPService:ProcessOcclusion() 
+    while getgenv().SnyX_Running and task.wait(0.15) do 
+        ESPService:ProcessESP() 
     end
 end)
 
 -- ==========================================
--- 9. CAMERA MANIPULATION ENGINE (BindToRenderStep)
+-- 8. MAIN CAMERA ENGINE
 -- ==========================================
-local CAMERA_BIND_NAME = "SnyX_CameraUpdate"
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 1.5
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Filled = false
+FOVCircle.Transparency = 0.7
+CleanupManager:AddDrawing("FOVCircle", FOVCircle)
 
-CleanupManager:AddCustomCleanup(function()
-    RunService:UnbindFromRenderStep(CAMERA_BIND_NAME)
-end)
-
--- ใช้ BindToRenderStep และเซ็ต Priority ไว้หลัง Camera (+1) เพื่อป้องกันเกมเขียนทับกลับจนเกิดอาการสั่น
-RunService:BindToRenderStep(CAMERA_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function(deltaTime)
+local _fovCircleFrame = 0
+local _fovCircleVisible = false
+CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
     local camera = getCamera()
     if not camera then return end
 
-    local viewport = camera.ViewportSize
-    local screenCenter = Vector2.new(viewport.X / 2, viewport.Y / 2)
-    
-    FOVCircle.Position = UDim2.fromOffset(screenCenter.X, screenCenter.Y)
-    FOVCircle.Size = UDim2.fromOffset(State.FOV * 2, State.FOV * 2)
-    FOVCircle.Visible = State.ShowFOV
+    -- Throttle FOVCircle drawing (every 6 frames)
+    _fovCircleFrame = _fovCircleFrame + 1
+    if _fovCircleFrame % 6 == 0 then
+        local vs = camera.ViewportSize
+        FOVCircle.Position = Vector2.new(vs.X * 0.5, vs.Y * 0.5)
+        FOVCircle.Radius = State.FOV
+        FOVCircle.Visible = State.ShowFOV
+    end
 
+    -- Early exit if aimbot is off
     if not State.Aimbot then
-        TargetService:ReleaseTarget()
+        if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
         return
     end
 
+    -- Keep target or release
     if TargetService.CurrentTarget then
-        if not TargetService:KeepTarget(camera, screenCenter) then
+        if not TargetService:KeepTarget(camera, Vector2.new(camera.ViewportSize.X * 0.5, camera.ViewportSize.Y * 0.5)) then
             TargetService:ReleaseTarget()
         end
     end
 
+    -- Acquire if no current target
     if not TargetService.CurrentTarget then
-        TargetService:AcquireTarget(camera, screenCenter)
+        local vs = camera.ViewportSize
+        TargetService:AcquireTarget(camera, Vector2.new(vs.X * 0.5, vs.Y * 0.5))
     end
 
-    if TargetService.CurrentTarget and TargetService.TargetPart then
-        local rootPart = TargetService.CurrentTarget.Character:FindFirstChild("HumanoidRootPart")
+    -- Apply aim (native camera move — not silent aim, no lag/stutter)
+    local ct = TargetService.CurrentTarget
+    local tp = TargetService.TargetPart
+    if ct and tp and ct.Character then
+        local rootPart = ct.Character:FindFirstChild("HumanoidRootPart")
         if rootPart then
-            local targetPos = getPredictedPosition(TargetService.TargetPart, rootPart)
+            -- Cached lerp speed: only recalc when Smoothness changes
+            local sm = State.Smoothness
+            if sm ~= _lastSmoothness then
+                _lastSmoothness = sm
+                _cachedLerpSpeed = math.clamp(sm * 35, 1, 60)
+            end
+
+            local targetPos = getPredictedPosition(tp, rootPart)
             local targetCFrame = CFrame.lookAt(camera.CFrame.Position, targetPos)
-            local lerpSpeed = math.clamp(State.Smoothness * 35, 1, 60)
-            local alpha = 1 - math.exp(-lerpSpeed * deltaTime)
+            -- Smooth lerp using exp decay (frame-rate independent)
+            local alpha = 1 - math.exp(-_cachedLerpSpeed * deltaTime)
             camera.CFrame = camera.CFrame:Lerp(targetCFrame, alpha)
         end
     end
-end)
+end))
 
 -- ==========================================
--- 10. CONFIGURATION UI
+-- 9. UI CONSTRUCTION
 -- ==========================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SnyX_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+CleanupManager:AddInstance("MainUI", ScreenGui)
+
 local ToggleBtn = Instance.new("TextButton")
 ToggleBtn.Size = UDim2.new(0, 45, 0, 45)
 ToggleBtn.Position = UDim2.new(0.03, 0, 0.2, 0)
@@ -585,14 +567,14 @@ local mainStroke = Instance.new("UIStroke")
 mainStroke.Color = Color3.fromRGB(45, 45, 45)
 mainStroke.Parent = MainFrame
 
-CleanupManager:AddConn("UIToggleBtn", ToggleBtn.MouseButton1Click:Connect(function()
+ToggleBtn.MouseButton1Click:Connect(function()
     MainFrame.Visible = not MainFrame.Visible
-end))
+end)
 
 local TitleBar = Instance.new("TextLabel")
 TitleBar.Size = UDim2.new(1, 0, 0, 35)
 TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-TitleBar.Text = "  SYSTEM CONFIGURATION"
+TitleBar.Text = "  SNYX ADVANCED SYSTEM"
 TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255)
 TitleBar.Font = Enum.Font.SourceSansBold
 TitleBar.TextSize = 14
@@ -614,13 +596,13 @@ local UIList = Instance.new("UIListLayout")
 UIList.Padding = UDim.new(0, 6)
 UIList.SortOrder = Enum.SortOrder.LayoutOrder
 UIList.Parent = ScrollFrame
-
-CleanupManager:AddConn("UIListLayout", UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
-end))
+end)
 
 local currentLayoutOrder = 0
 
+-- ฟังก์ชันสร้างปุ่มเปิดปิด
 local function createToggle(text, initialState, callback)
     currentLayoutOrder = currentLayoutOrder + 1
     local frame = Instance.new("Frame")
@@ -659,14 +641,15 @@ local function createToggle(text, initialState, callback)
     btnCorner.Parent = btn
 
     local isToggled = initialState
-    CleanupManager:AddConn("Toggle_" .. tostring(currentLayoutOrder), btn.MouseButton1Click:Connect(function()
+    btn.MouseButton1Click:Connect(function()
         isToggled = not isToggled
         btn.Text = isToggled and "ON" or "OFF"
         btn.BackgroundColor3 = isToggled and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
         callback(isToggled)
-    end))
+    end)
 end
 
+-- ฟังก์ชันสร้างปุ่มสลับโหมด
 local function createModeSelector(text, modesArray, initialIndex, callback)
     currentLayoutOrder = currentLayoutOrder + 1
     local frame = Instance.new("Frame")
@@ -705,12 +688,12 @@ local function createModeSelector(text, modesArray, initialIndex, callback)
     btnCorner.Parent = btn
 
     local currentIndex = initialIndex
-    CleanupManager:AddConn("Mode_" .. tostring(currentLayoutOrder), btn.MouseButton1Click:Connect(function()
+    btn.MouseButton1Click:Connect(function()
         currentIndex = currentIndex + 1
         if currentIndex > #modesArray then currentIndex = 1 end
         btn.Text = modesArray[currentIndex]
         callback(modesArray[currentIndex])
-    end))
+    end)
 end
 
 local function createSlider(text, min, max, default, step, callback)
@@ -771,20 +754,8 @@ local function createSlider(text, min, max, default, step, callback)
     fillCorner.Parent = sliderFill
 
     local dragging = false
-    local moveConn, relConn
-
-    CleanupManager:AddCustomCleanup(function()
-        if moveConn then moveConn:Disconnect() end
-        if relConn then relConn:Disconnect() end
-    end)
-
-    CleanupManager:AddConn("Slider_" .. tostring(currentLayoutOrder), sliderBar.InputBegan:Connect(function(input)
+    sliderBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            
-            -- ป้องกัน Connection ซ้อนทับกันเมื่อมีการกดลากใหม่
-            if moveConn then moveConn:Disconnect() moveConn = nil end
-            if relConn then relConn:Disconnect() relConn = nil end
-
             dragging = true
             local function update(inp)
                 local ratio = math.clamp((inp.Position.X - sliderBar.AbsolutePosition.X) / sliderBar.AbsoluteSize.X, 0, 1)
@@ -794,39 +765,36 @@ local function createSlider(text, min, max, default, step, callback)
                 callback(stepped)
             end
             update(input)
-            
+            local moveConn, relConn
             moveConn = UserInputService.InputChanged:Connect(function(moveInp)
                 if dragging and (moveInp.UserInputType == Enum.UserInputType.MouseMovement or moveInp.UserInputType == Enum.UserInputType.Touch) then
                     update(moveInp)
                 end
             end)
-            
             relConn = UserInputService.InputEnded:Connect(function(relInp)
                 if relInp.UserInputType == Enum.UserInputType.MouseButton1 or relInp.UserInputType == Enum.UserInputType.Touch then
                     dragging = false
-                    if moveConn then moveConn:Disconnect() moveConn = nil end
-                    if relConn then relConn:Disconnect() relConn = nil end
+                    moveConn:Disconnect()
+                    relConn:Disconnect()
                 end
             end)
         end
-    end))
+    end)
 end
 
 -- ==========================================
--- INITIALIZE CONTROLS
+-- สร้างปุ่มควบคุมทั้งหมด
 -- ==========================================
 createToggle("Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
 createModeSelector("Target Part", {"Head", "Torso", "Random"}, 1, function(v) State.TargetPartMode = v end)
 createToggle("Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
-createToggle("Team Check", State.TeamCheck, function(v) 
-    State.TeamCheck = v 
-    ESPService:UpdateState() 
-end)
+createToggle("Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
 createToggle("Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
 
 createToggle("Prediction Engine", State.Prediction, function(v) State.Prediction = v end)
 createToggle("Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
-createToggle("Gravity Compensation (Aim Up)", State.GravityCompensation, function(v) State.GravityCompensation = v end)
+
+-- [FIX 6 & 7]: แก้ไขชื่อให้สื่อความหมายชัดเจน และ UpdateAuto เพื่อดึงค่าใหม่
 createToggle("Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v) 
     State.DropIsMultiplier = v 
     WeaponService:UpdateAuto()
@@ -837,14 +805,8 @@ createToggle("Auto Weapon Speed", State.AutoBulletSpeed, function(v)
     WeaponService:UpdateAuto()
 end)
 
-createToggle("ESP Visibility", State.ESP, function(v) 
-    State.ESP = v 
-    ESPService:UpdateState() 
-end)
-createToggle("ESP Username", State.ESPName, function(v) 
-    State.ESPName = v 
-    ESPService:UpdateState() 
-end)
+createToggle("ESP Wallhack", State.ESP, function(v) State.ESP = v end)
+createToggle("ESP Username", State.ESPName, function(v) State.ESPName = v end)
 
 createSlider("Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v) 
     State.BulletSpeed = v 
@@ -856,3 +818,13 @@ createSlider("Manual Gravity", 0, 500, State.BulletGravity, 10, function(v)
 end)
 createSlider("Smoothness", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
 createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
+
+-- EXPORT LOCALS FOR TESTING / EXTERNAL ACCESS
+getgenv().State = State
+getgenv().WeaponService = WeaponService
+getgenv().VisibilityService = VisibilityService
+getgenv().TargetService = TargetService
+getgenv().ESPService = ESPService
+getgenv().isValidEnemy = isValidEnemy
+getgenv().getPredictedPosition = getPredictedPosition
+getgenv().CleanupManager = CleanupManager
